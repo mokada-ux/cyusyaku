@@ -1,167 +1,92 @@
 import streamlit as st
-import os
-import cv2
-import whisper
-import shutil
+from PIL import Image, ImageDraw, ImageFont
+import io
 import zipfile
-import datetime
-from scenedetect import VideoManager, SceneManager
-from scenedetect.detectors import ContentDetector
 
-# --- 設定 ---
-UPLOAD_DIR = "temp_uploads"
-OUTPUT_DIR = "temp_outputs"
-# フォルダがなければ作成
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# --- 関数: 時間表示 ---
-def format_time(seconds):
-    return str(datetime.timedelta(seconds=int(seconds)))
-
-# --- 関数: フォルダリセット ---
-def clear_output_folder():
-    if os.path.exists(OUTPUT_DIR):
-        shutil.rmtree(OUTPUT_DIR)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# --- 関数: シーン抽出 ---
-def extract_scenes(video_path):
-    video_manager = VideoManager([video_path])
-    scene_manager = SceneManager()
-    # threshold=27.0 は感度の標準値。動きが少ない動画なら下げてください。
-    scene_manager.add_detector(ContentDetector(threshold=27.0))
+def add_text_to_image(image, text, font_path, font_size, text_color, stroke_width, stroke_color, x, y):
+    """画像にテキストを追加する関数"""
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
     
-    video_manager.start()
-    scene_manager.detect_scenes(frame_source=video_manager)
-    scene_list = scene_manager.get_scene_list()
+    # フォントの読み込み（失敗時はデフォルト）
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except:
+        # フォントファイルがない場合はデフォルトを使用（日本語非対応の可能性あり）
+        font = ImageFont.load_default()
+        st.warning("指定されたフォントが読み込めないため、デフォルトフォントを使用します。")
+
+    # テキスト描画（境界線付き）
+    draw.text((x, y), text, font=font, fill=text_color, stroke_width=stroke_width, stroke_fill=stroke_color)
     
-    cap = cv2.VideoCapture(video_path)
-    scenes_data = []
+    return img
 
-    progress_bar = st.progress(0, text="シーン検出中...")
-    total_scenes = len(scene_list)
+st.title("一括画像テキスト追加アプリ 🖼️")
+
+# --- サイドバー：設定 ---
+st.sidebar.header("テキスト設定")
+text_input = st.sidebar.text_input("画像に入れるテキスト", "Sample Text")
+
+# フォント設定
+st.sidebar.subheader("フォント")
+uploaded_font = st.sidebar.file_uploader("フォントファイル(.ttf/.otf)をアップロード", type=["ttf", "otf"])
+# デフォルトのフォントパス（アップロードがない場合）
+font_path = uploaded_font if uploaded_font else "arial.ttf" 
+
+# スタイル設定
+font_size = st.sidebar.slider("文字サイズ", 10, 200, 50)
+text_color = st.sidebar.color_picker("文字色", "#FFFFFF")
+stroke_width = st.sidebar.slider("境界線の太さ", 0, 20, 2)
+stroke_color = st.sidebar.color_picker("境界線の色", "#000000")
+
+# 位置設定
+st.sidebar.subheader("位置調整")
+pos_x = st.sidebar.number_input("X座標 (横)", value=50)
+pos_y = st.sidebar.number_input("Y座標 (縦)", value=50)
+
+# --- メインエリア：画像アップロード ---
+uploaded_files = st.file_uploader("画像をアップロード (複数可)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+
+if uploaded_files:
+    st.write(f"合計 {len(uploaded_files)} 枚の画像を処理します。")
     
-    for i, scene in enumerate(scene_list):
-        start_time = scene[0].get_seconds()
+    # ZIP作成用のバッファ
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        # プレビューは最初の数枚だけ表示（負荷軽減）
+        st.subheader("プレビュー (最初の1枚)")
         
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
-        ret, frame = cap.read()
-        
-        if ret:
-            img_filename = f"scene_{i:03d}_{int(start_time)}s.jpg"
-            img_path = os.path.join(OUTPUT_DIR, img_filename)
-            cv2.imwrite(img_path, frame)
+        for i, uploaded_file in enumerate(uploaded_files):
+            # 画像を開く
+            image = Image.open(uploaded_file)
             
-            scenes_data.append({
-                "time_str": format_time(start_time),
-                "seconds": start_time,
-                "img_path": img_path,
-                "filename": img_filename
-            })
-        
-        if total_scenes > 0:
-            progress_bar.progress(min((i + 1) / total_scenes, 1.0))
+            # フォントファイルがアップロードされているかチェック
+            current_font = uploaded_font if uploaded_font else "DejaVuSans.ttf" # Linux環境(Streamlit Cloud)向けフォールバック
 
-    cap.release()
-    progress_bar.empty()
-    return scenes_data
-
-# --- 関数: 音声書き起こし ---
-@st.cache_resource
-def load_whisper_model():
-    return whisper.load_model("base") # 精度重視なら "small" や "medium" に変更
-
-def transcribe_audio(video_path):
-    model = load_whisper_model()
-    # st.spinner で処理中を表示
-    with st.spinner("AIが音声を解析しています... (動画の長さにより数分かかります)"):
-        result = model.transcribe(video_path)
-    return result["segments"]
-
-# --- 関数: ZIP作成 ---
-def create_zip(file_paths):
-    zip_path = os.path.join(OUTPUT_DIR, "scenes.zip")
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        for file in file_paths:
-            zipf.write(file, os.path.basename(file))
-    return zip_path
-
-# ==========================================
-# メインUI (Streamlit)
-# ==========================================
-st.set_page_config(page_title="動画解析アプリ", layout="wide")
-
-st.title("🎥 動画シーン & 字幕抽出ツール")
-st.markdown("動画をアップするだけで「**場面写真**」と「**文字起こし**」を一括生成します。")
-
-# サイドバー設定
-with st.sidebar:
-    st.header("設定")
-    enable_scene = st.checkbox("シーン画像を抽出する", value=True)
-    enable_text = st.checkbox("音声を文字起こしする", value=True)
-    st.divider()
-    st.info("※ FFmpegがインストールされている必要があります。")
-
-uploaded_file = st.file_uploader("動画ファイルをアップロード", type=["mp4", "mov", "avi", "mkv"])
-
-if uploaded_file is not None:
-    # ファイル保存
-    video_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-    with open(video_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
-    st.success(f"読み込み完了: {uploaded_file.name}")
-
-    if st.button("🚀 解析スタート", type="primary"):
-        clear_output_folder()
-        
-        # 1. シーン抽出
-        scenes = []
-        if enable_scene:
-            st.subheader("📸 検出されたシーン")
-            scenes = extract_scenes(video_path)
-            
-            if scenes:
-                # ギャラリー表示
-                cols = st.columns(4)
-                img_paths = []
-                for i, scene in enumerate(scenes):
-                    with cols[i % 4]:
-                        st.image(scene["img_path"], caption=scene["time_str"])
-                    img_paths.append(scene["img_path"])
-                
-                # ZIPダウンロードボタン
-                zip_path = create_zip(img_paths)
-                with open(zip_path, "rb") as fp:
-                    st.download_button(
-                        label="📥 全画像をZIPでダウンロード",
-                        data=fp,
-                        file_name="scene_images.zip",
-                        mime="application/zip"
-                    )
-            else:
-                st.warning("シーンの変化が検出されませんでした。")
-        
-        st.divider()
-
-        # 2. 文字起こし
-        if enable_text:
-            st.subheader("📝 文字起こし結果")
-            segments = transcribe_audio(video_path)
-            
-            full_text = ""
-            for segment in segments:
-                line = f"[{format_time(segment['start'])}] {segment['text']}\n"
-                full_text += line
-            
-            # テキストエリア表示
-            st.text_area("書き起こし内容", full_text, height=300)
-            
-            # テキストダウンロードボタン
-            st.download_button(
-                label="📥 テキストファイル(.txt)で保存",
-                data=full_text,
-                file_name="transcription.txt",
-                mime="text/plain"
+            # テキスト追加処理
+            processed_img = add_text_to_image(
+                image, text_input, current_font, font_size, text_color, stroke_width, stroke_color, pos_x, pos_y
             )
+            
+            # 1枚目だけ画面に表示して確認させる
+            if i == 0:
+                st.image(processed_img, caption="プレビュー", use_container_width=True)
+            
+            # 画像をバイト列に変換してZIPに追加
+            img_byte_arr = io.BytesIO()
+            # 元のフォーマットを維持、なければPNG
+            fmt = image.format if image.format else 'PNG'
+            processed_img.save(img_byte_arr, format=fmt)
+            zf.writestr(f"processed_{uploaded_file.name}", img_byte_arr.getvalue())
+
+    # ZIPダウンロードボタン
+    st.download_button(
+        label="すべての画像をまとめてダウンロード (ZIP)",
+        data=zip_buffer.getvalue(),
+        file_name="processed_images.zip",
+        mime="application/zip"
+    )
+
+# 補足説明
+st.info("日本語を使用する場合は、必ず日本語対応のフォントファイル(.ttf)をサイドバーからアップロードしてください。")
